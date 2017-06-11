@@ -17,6 +17,7 @@ use std::ops::Deref;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, Component};
 use std::process;
+use std::sync::Arc;
 
 use clap::{App, AppSettings, Arg};
 use atty::Stream;
@@ -90,6 +91,9 @@ fn print_entry(base: &Path, entry: &Path, config: &FdOptions) {
     #[cfg(not(target_family = "unix"))]
     let is_executable =  |p: &std::path::PathBuf| {false};
 
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+
     if let Some(ref ls_colors) = config.ls_colors {
         let default_style = ansi_term::Style::default();
 
@@ -136,20 +140,20 @@ fn print_entry(base: &Path, entry: &Path, config: &FdOptions) {
                     }
                 };
 
-            print!("{}", style.paint(comp_str));
+            write!(handle, "{}", style.paint(comp_str));
 
             if component_path.is_dir() && component_path != path_full {
                 let sep = std::path::MAIN_SEPARATOR.to_string();
-                print!("{}", style.paint(sep));
+                write!(handle, "{}", style.paint(sep));
             }
         }
-        println!();
+        writeln!(handle);
     } else {
         // Uncolorized output
 
         let prefix = if config.path_display == PathDisplay::Absolute { ROOT_DIR } else { "" };
 
-        let r = writeln!(&mut std::io::stdout(), "{}{}", prefix, path_str);
+        let r = writeln!(handle, "{}{}", prefix, path_str);
 
         if r.is_err() {
             // Probably a broken pipe. Exit gracefully.
@@ -159,7 +163,7 @@ fn print_entry(base: &Path, entry: &Path, config: &FdOptions) {
 }
 
 /// Recursively scan the given search path and search for files / pathnames matching the pattern.
-fn scan(root: &Path, pattern: &Regex, base: &Path, config: &FdOptions) {
+fn scan(root: &Path, pattern: Arc<Regex>, base: &Path, config: Arc<FdOptions>) {
     let walker = WalkBuilder::new(root)
                      .hidden(config.ignore_hidden)
                      .ignore(config.read_ignore)
@@ -169,31 +173,41 @@ fn scan(root: &Path, pattern: &Regex, base: &Path, config: &FdOptions) {
                      .git_exclude(config.read_ignore)
                      .follow_links(config.follow_links)
                      .max_depth(config.max_depth)
-                     .build()
-                     .into_iter()
-                     .filter_map(|e| e.ok())
-                     .filter(|e| e.path() != root);
+                     .build_parallel();
 
-    for entry in walker {
-        let path_rel_buf = match fshelper::path_relative_from(entry.path(), base) {
-            Some(p) => p,
-            None => error("Error: could not get relative path for directory entry.")
-        };
-        let path_rel = path_rel_buf.as_path();
+    walker.run(|| {
+        let base = base.to_owned();
+        let config = config.clone();
+        let pattern = pattern.clone();
 
-        let search_str_o =
-            if config.search_full_path {
-                Some(path_rel.to_string_lossy())
-            } else {
-                path_rel.file_name()
-                        .map(|f| f.to_string_lossy())
+        Box::new(move |entry_o| {
+            let entry = match entry_o {
+                Ok(e) => e,
+                Err(_) => return ignore::WalkState::Continue
             };
 
-        if let Some(search_str) = search_str_o {
-            pattern.find(&*search_str)
-                      .map(|_| print_entry(base, path_rel, config));
-        }
-    }
+            let path_rel_buf = match fshelper::path_relative_from(entry.path(), &*base) {
+                Some(p) => p,
+                None => error("Error: could not get relative path for directory entry.")
+            };
+            let path_rel = path_rel_buf.as_path();
+
+            let search_str_o =
+                if config.search_full_path {
+                    Some(path_rel.to_string_lossy())
+                } else {
+                    path_rel.file_name()
+                            .map(|f| f.to_string_lossy())
+                };
+
+            if let Some(search_str) = search_str_o {
+                pattern.find(&*search_str)
+                          .map(|_| print_entry(&base, path_rel, &config));
+            }
+
+            ignore::WalkState::Continue
+        })
+    });
 }
 
 /// Print error message to stderr and exit with status `1`.
@@ -325,7 +339,7 @@ fn main() {
     match RegexBuilder::new(pattern)
               .case_insensitive(!config.case_sensitive)
               .build() {
-        Ok(re)   => scan(root_dir, &re, base, &config),
+        Ok(re)   => scan(root_dir, Arc::new(re), base, Arc::new(config)),
         Err(err) => error(err.description())
     }
 }
