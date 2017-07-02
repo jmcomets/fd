@@ -150,14 +150,17 @@ fn print_entry(base: &Path, entry: &PathBuf, config: &FdOptions) {
                     }
                 };
 
-            write!(handle, "{}", style.paint(comp_str));
+            write!(handle, "{}", style.paint(comp_str)).ok();
 
             if component_path.is_dir() && component_path != path_full {
                 let sep = std::path::MAIN_SEPARATOR.to_string();
-                write!(handle, "{}", style.paint(sep));
+                write!(handle, "{}", style.paint(sep)).ok();
             }
         }
-        writeln!(handle);
+        if writeln!(handle).is_err() {
+            // Probably a broken pipe. Exit gracefully.
+            process::exit(0);
+        }
     } else {
         // Uncolorized output
 
@@ -237,7 +240,7 @@ fn scan(root: &Path, pattern: Arc<Regex>, base: &Path, config: Arc<FdOptions>) {
 
     // Maximum time to wait before we start streaming to the console.
     let max_buffer_time = config.max_buffer_time
-                                .unwrap_or(time::Duration::from_millis(100));
+                                .unwrap_or_else(|| time::Duration::from_millis(100));
 
     for value in rx {
         if buffering {
@@ -247,7 +250,7 @@ fn scan(root: &Path, pattern: Arc<Regex>, base: &Path, config: Arc<FdOptions>) {
             if time::Instant::now() - start > max_buffer_time {
                 // Flush the buffer
                 for v in &buffer {
-                    print_entry(&base, &v, &config);
+                    print_entry(base, v, &config);
                 }
                 buffer.clear();
 
@@ -255,7 +258,7 @@ fn scan(root: &Path, pattern: Arc<Regex>, base: &Path, config: Arc<FdOptions>) {
                 buffering = false;
             }
         } else {
-            print_entry(&base, &value, &config);
+            print_entry(base, &value, &config);
         }
     }
 
@@ -263,7 +266,7 @@ fn scan(root: &Path, pattern: Arc<Regex>, base: &Path, config: Arc<FdOptions>) {
     // anything to the console, yet. In this case, sort the output and print it:
     buffer.sort();
     for value in buffer {
-        print_entry(&base, &value, &config);
+        print_entry(base, &value, &config);
     }
 }
 
