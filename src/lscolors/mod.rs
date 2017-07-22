@@ -1,11 +1,12 @@
 /// A parser for the `LS_COLORS` environment variable.
-extern crate ansi_term;
+extern crate termcolor;
 
 use std::collections::HashMap;
 
-use self::ansi_term::{Style, Colour};
+use self::termcolor::{Color, ColorSpec, StandardStream, ColorChoice, WriteColor};
 
 use std::io;
+use std::io::Write;
 use std::borrow::Cow;
 use std::path::Path;
 
@@ -44,9 +45,9 @@ impl Default for LsColors {
     /// Get a default LsColors structure.
     fn default() -> LsColors {
         LsColors {
-            directory: Colour::Blue.bold(),
-            symlink: Colour::Cyan.normal(),
-            executable: Colour::Red.bold(),
+            directory: Color::Blue.bold(),
+            symlink: Color::Cyan.normal(),
+            executable: Color::Red.bold(),
             extensions: HashMap::new(),
             filenames: HashMap::new()
         }
@@ -55,12 +56,12 @@ impl Default for LsColors {
 
 impl LsColors {
     /// Parse a single text-decoration code (normal, bold, italic, ...).
-    fn parse_decoration(code: &str) -> Option<fn(Colour) -> Style> {
+    fn parse_decoration(code: &str) -> Option<fn(Color) -> Style> {
         match code {
-            "0" | "00" => Some(Colour::normal),
-            "1" | "01" => Some(Colour::bold),
-            "3" | "03" => Some(Colour::italic),
-            "4" | "04" => Some(Colour::underline),
+            "0" | "00" => Some(Color::normal),
+            "1" | "01" => Some(Color::bold),
+            "3" | "03" => Some(Color::italic),
+            "4" | "04" => Some(Color::underline),
             _ => None
         }
     }
@@ -79,27 +80,29 @@ impl LsColors {
 
             let color =
                 if c1 == Some("38") && c2 == Some("5") {
-                    let n_white = 7;
-                    let n = if let Some(num) = c3 {
-                        u8::from_str_radix(num, 10).unwrap_or(n_white)
-                    } else {
-                        n_white
-                    };
+                    // TODO: support fixed colors
+                    return None;
+                    //let n_white = 7;
+                    //let n = if let Some(num) = c3 {
+                    //    u8::from_str_radix(num, 10).unwrap_or(n_white)
+                    //} else {
+                    //    n_white
+                    //};
 
-                    Colour::Fixed(n)
+                    //Color::Fixed(n)
                 } else if let Some(color_s) = c1 {
                     match color_s {
-                        "30" => Colour::Black,
-                        "31" => Colour::Red,
-                        "32" => Colour::Green,
-                        "33" => Colour::Yellow,
-                        "34" => Colour::Blue,
-                        "35" => Colour::Purple,
-                        "36" => Colour::Cyan,
-                        _    => Colour::White
+                        "30" => Color::Black,
+                        "31" => Color::Red,
+                        "32" => Color::Green,
+                        "33" => Color::Yellow,
+                        "34" => Color::Blue,
+                        "35" => Color::Magenta, // Purple is not available?
+                        "36" => Color::Cyan,
+                        _    => Color::White
                     }
                 } else {
-                    Colour::White
+                    Color::White
                 };
 
             if decoration.is_none() {
@@ -109,7 +112,7 @@ impl LsColors {
                                  .next();
             }
 
-            let ansi_style = decoration.unwrap_or(Colour::normal)(color);
+            let ansi_style = decoration.unwrap_or(Color::normal)(color);
 
             Some(ansi_style)
         } else {
@@ -166,16 +169,10 @@ impl LsColors {
     }
 
     pub fn print_with_style<'a>(&self, s: &str, style: PaintStyle<'a>) -> io::Result<()> {
-        self.paint_with_style(&mut io::stdout(), s, style)
-    }
-
-    fn paint_with_style<'a, W>(&self, writer: &mut W, s: &str, style: PaintStyle<'a>) -> io::Result<()>
-        where W: io::Write
-    {
         let style = match style {
-            PaintStyle::Directory    => Cow::Borrowed(&self.directory),
-            PaintStyle::Executable   => Cow::Borrowed(&self.executable),
-            PaintStyle::Symlink      => Cow::Borrowed(&self.symlink),
+            PaintStyle::Directory    => Some(Cow::Borrowed(&self.directory)),
+            PaintStyle::Executable   => Some(Cow::Borrowed(&self.executable)),
+            PaintStyle::Symlink      => Some(Cow::Borrowed(&self.symlink)),
 
             PaintStyle::Filename(f)  => {
                 f.file_name()
@@ -188,11 +185,16 @@ impl LsColors {
                             .and_then(|e| self.extensions.get(e))
                             .map(Cow::Borrowed)
                     })
-                    .unwrap_or(Cow::default())
             }
         };
 
-        write!(writer, "{}", style.paint(s))
+        if let Some(style) = style {
+            let mut stdout = StandardStream::stdout(ColorChoice::Always);
+            try!(stdout.set_color(&style.to_color_spec()));
+            write!(&mut stdout, "{}", s)
+        } else {
+            write!(&mut io::stdout(), "{}", s)
+        }
     }
 }
 
@@ -204,48 +206,100 @@ pub enum PaintStyle<'a> {
     Filename(&'a Path),
 }
 
+#[derive(Debug, PartialEq, Clone)]
+struct Style(Color, TextStyle);
+
+impl Style {
+    fn to_color_spec(&self) -> ColorSpec {
+        let mut c = ColorSpec::new();
+
+        c.set_fg(Some(self.0.clone()));
+
+        match self.1 {
+            TextStyle::Normal => {c.set_bold(false);},
+            TextStyle::Bold   => {c.set_bold(true);},
+            _                 => {},
+        }
+
+        c
+    }
+}
+
+trait StyleColor {
+    fn normal(self) -> Style;
+    fn bold(self) -> Style;
+    fn italic(self) -> Style;
+    fn underline(self) -> Style;
+}
+
+impl StyleColor for Color {
+    fn normal(self) -> Style {
+        Style(self, TextStyle::Normal)
+    }
+
+    fn bold(self) -> Style {
+        Style(self, TextStyle::Bold)
+    }
+
+    fn italic(self) -> Style {
+        Style(self, TextStyle::Italic)
+    }
+
+    fn underline(self) -> Style {
+        Style(self, TextStyle::Underline)
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum TextStyle {
+    Normal,
+    Bold,
+    Italic,
+    Underline,
+}
+
 #[test]
 fn test_parse_simple() {
-    assert_eq!(Some(Colour::Red.normal()),
+    assert_eq!(Some(Color::Red.normal()),
                LsColors::parse_style("31"));
 }
 
 #[test]
 fn test_parse_decoration() {
-    assert_eq!(Some(Colour::Red.normal()),
+    assert_eq!(Some(Color::Red.normal()),
                LsColors::parse_style("00;31"));
 
-    assert_eq!(Some(Colour::Blue.italic()),
+    assert_eq!(Some(Color::Blue.italic()),
                LsColors::parse_style("03;34"));
 
-    assert_eq!(Some(Colour::Cyan.bold()),
+    assert_eq!(Some(Color::Cyan.bold()),
                LsColors::parse_style("01;36"));
 }
 
 #[test]
 fn test_parse_decoration_backwards() {
-    assert_eq!(Some(Colour::Blue.italic()),
+    assert_eq!(Some(Color::Blue.italic()),
                LsColors::parse_style("34;03"));
 
-    assert_eq!(Some(Colour::Cyan.bold()),
+    assert_eq!(Some(Color::Cyan.bold()),
                LsColors::parse_style("36;01"));
 
-    assert_eq!(Some(Colour::Red.normal()),
+    assert_eq!(Some(Color::Red.normal()),
                LsColors::parse_style("31;00"));
 }
 
 #[test]
 fn test_parse_256() {
-    assert_eq!(Some(Colour::Fixed(115).normal()),
+    assert_eq!(Some(Color::Fixed(115).normal()),
                LsColors::parse_style("38;5;115"));
 
-    assert_eq!(Some(Colour::Fixed(115).normal()),
+    assert_eq!(Some(Color::Fixed(115).normal()),
                LsColors::parse_style("00;38;5;115"));
 
-    assert_eq!(Some(Colour::Fixed(119).bold()),
+    assert_eq!(Some(Color::Fixed(119).bold()),
                LsColors::parse_style("01;38;5;119"));
 
-    assert_eq!(Some(Colour::Fixed(119).bold()),
+    assert_eq!(Some(Color::Fixed(119).bold()),
                LsColors::parse_style("38;5;119;01"));
 }
 
@@ -256,8 +310,8 @@ fn test_from_string() {
     let result = LsColors::from_string(
         &String::from("rs=0:di=03;34:ln=01;36:*.foo=01;35:*README=33"));
 
-    assert_eq!(Colour::Blue.italic(), result.directory);
-    assert_eq!(Colour::Cyan.bold(), result.symlink);
-    assert_eq!(Some(&Colour::Purple.bold()), result.extensions.get("foo"));
-    assert_eq!(Some(&Colour::Yellow.normal()), result.filenames.get("README"));
+    assert_eq!(Color::Blue.italic(), result.directory);
+    assert_eq!(Color::Cyan.bold(), result.symlink);
+    assert_eq!(Some(&Color::Purple.bold()), result.extensions.get("foo"));
+    assert_eq!(Some(&Color::Yellow.normal()), result.filenames.get("README"));
 }
