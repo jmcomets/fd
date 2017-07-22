@@ -1,6 +1,5 @@
 #[macro_use]
 extern crate clap;
-extern crate ansi_term;
 extern crate atty;
 extern crate regex;
 extern crate ignore;
@@ -23,7 +22,7 @@ use atty::Stream;
 use regex::{Regex, RegexBuilder};
 use ignore::WalkBuilder;
 
-use lscolors::LsColors;
+use lscolors::{LsColors, PaintStyle};
 
 /// Defines how to display search result paths.
 #[derive(PartialEq)]
@@ -78,79 +77,12 @@ static PARENT_DIR : &'static str = "..";
 
 /// Print a search result to the console.
 fn print_entry(base: &Path, entry: &Path, config: &FdOptions) {
-    let path_full = base.join(entry);
-
     let path_str = entry.to_string_lossy();
 
-    #[cfg(target_family = "unix")]
-    let is_executable = |p: &std::path::PathBuf| {
-        p.metadata()
-         .ok()
-         .map(|f| f.permissions().mode() & 0o111 != 0)
-         .unwrap_or(false)
-    };
-
-    #[cfg(not(target_family = "unix"))]
-    let is_executable =  |p: &std::path::PathBuf| {false};
-
     if let Some(ref ls_colors) = config.ls_colors {
-        let default_style = ansi_term::Style::default();
-
-        let mut component_path = base.to_path_buf();
-
-        if config.path_display == PathDisplay::Absolute {
-            print!("{}", ls_colors.directory.paint(ROOT_DIR));
-        }
-
-        // Traverse the path and colorize each component
-        for component in entry.components() {
-            let comp_str = match component {
-                Component::Normal(p) => p.to_string_lossy(),
-                Component::ParentDir => Cow::from(PARENT_DIR),
-                _                    => error("Error: unexpected path component.")
-            };
-
-            component_path.push(Path::new(comp_str.deref()));
-
-            let style =
-                if component_path.symlink_metadata()
-                                 .map(|md| md.file_type().is_symlink())
-                                 .unwrap_or(false) {
-                    &ls_colors.symlink
-                } else if component_path.is_dir() {
-                    &ls_colors.directory
-                } else if is_executable(&component_path) {
-                    &ls_colors.executable
-                } else {
-                    // Look up file name
-                    let o_style =
-                        component_path.file_name()
-                                      .and_then(|n| n.to_str())
-                                      .and_then(|n| ls_colors.filenames.get(n));
-
-                    match o_style {
-                        Some(s) => s,
-                        None =>
-                            // Look up file extension
-                            component_path.extension()
-                                          .and_then(|e| e.to_str())
-                                          .and_then(|e| ls_colors.extensions.get(e))
-                                          .unwrap_or(&default_style)
-                    }
-                };
-
-            print!("{}", style.paint(comp_str));
-
-            if component_path.is_dir() && component_path != path_full {
-                let sep = std::path::MAIN_SEPARATOR.to_string();
-                print!("{}", style.paint(sep));
-            }
-        }
-        if config.null_separator {
-          print!("{}", '\0');
-        } else {
-          println!();
-        }
+        let print_abs_path = config.path_display == PathDisplay::Absolute;
+        let use_null_separator = config.null_separator;
+        colored_print(base, entry, ls_colors, print_abs_path, use_null_separator);
     } else {
         // Uncolorized output
 
@@ -163,6 +95,65 @@ fn print_entry(base: &Path, entry: &Path, config: &FdOptions) {
             // Probably a broken pipe. Exit gracefully.
             process::exit(0);
         }
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn is_executable(p: &std::path::PathBuf) -> bool {
+    p.metadata()
+        .ok()
+        .map(|f| f.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_family = "unix"))]
+fn is_executable(p: &std::path::PathBuf) -> bool {
+    false
+}
+
+fn colored_print(base: &Path, entry: &Path, ls_colors: &LsColors, print_abs_path: bool, use_null_separator: bool) {
+    let mut component_path = base.to_path_buf();
+
+    if print_abs_path {
+        ls_colors.print_with_style(ROOT_DIR, PaintStyle::Directory);
+    }
+
+    // Traverse the path and colorize each component
+    for component in entry.components() {
+        let comp_str = match component {
+            Component::Normal(p) => p.to_string_lossy(),
+            Component::ParentDir => Cow::from(PARENT_DIR),
+            _                    => error("Error: unexpected path component.")
+        };
+
+        component_path.push(Path::new(comp_str.deref()));
+
+        let style =
+            if component_path.symlink_metadata()
+                                .map(|md| md.file_type().is_symlink())
+                                .unwrap_or(false) {
+                PaintStyle::Symlink
+            } else if component_path.is_dir() {
+                PaintStyle::Directory
+            } else if is_executable(&component_path) {
+                PaintStyle::Executable
+            } else {
+                PaintStyle::Filename(&component_path)
+            };
+
+        ls_colors.print_with_style(&comp_str, style);
+
+        let path_full = base.join(entry);
+        if component_path.is_dir() && component_path != path_full {
+            let sep = std::path::MAIN_SEPARATOR.to_string();
+            ls_colors.print_with_style(&sep, style);
+        }
+    }
+
+    if use_null_separator {
+        print!("{}", '\0');
+    } else {
+        println!();
     }
 }
 

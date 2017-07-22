@@ -1,7 +1,13 @@
 /// A parser for the `LS_COLORS` environment variable.
+extern crate ansi_term;
 
 use std::collections::HashMap;
-use ansi_term::{Style, Colour};
+
+use self::ansi_term::{Style, Colour};
+
+use std::io;
+use std::borrow::Cow;
+use std::path::Path;
 
 /// Maps file extensions to ANSI colors / styles.
 pub type ExtensionStyles = HashMap<String, Style>;
@@ -19,19 +25,19 @@ const LS_CODES: &'static [&'static str] =
 #[derive(Debug, PartialEq)]
 pub struct LsColors {
     /// ANSI Style for directories.
-    pub directory: Style,
+    directory: Style,
 
     /// ANSI style for symbolic links.
-    pub symlink: Style,
+    symlink: Style,
 
     /// ANSI style for executable files.
-    pub executable: Style,
+    executable: Style,
 
     /// A map that defines ANSI styles for different file extensions.
-    pub extensions: ExtensionStyles,
+    extensions: ExtensionStyles,
 
     /// A map that defines ANSI styles for different specific filenames.
-    pub filenames: FilenameStyles,
+    filenames: FilenameStyles,
 }
 
 impl Default for LsColors {
@@ -158,6 +164,44 @@ impl LsColors {
 
         lscolors
     }
+
+    pub fn print_with_style<'a>(&self, s: &str, style: PaintStyle<'a>) -> io::Result<()> {
+        self.paint_with_style(&mut io::stdout(), s, style)
+    }
+
+    fn paint_with_style<'a, W>(&self, writer: &mut W, s: &str, style: PaintStyle<'a>) -> io::Result<()>
+        where W: io::Write
+    {
+        let style = match style {
+            PaintStyle::Directory    => Cow::Borrowed(&self.directory),
+            PaintStyle::Executable   => Cow::Borrowed(&self.executable),
+            PaintStyle::Symlink      => Cow::Borrowed(&self.symlink),
+
+            PaintStyle::Filename(f)  => {
+                f.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| self.filenames.get(n))
+                    .map(Cow::Borrowed)
+                    .or_else(|| {
+                        f.extension()
+                            .and_then(|e| e.to_str())
+                            .and_then(|e| self.extensions.get(e))
+                            .map(Cow::Borrowed)
+                    })
+                    .unwrap_or(Cow::default())
+            }
+        };
+
+        write!(writer, "{}", style.paint(s))
+    }
+}
+
+#[derive(Copy, Clone)]
+pub enum PaintStyle<'a> {
+    Directory,
+    Executable,
+    Symlink,
+    Filename(&'a Path),
 }
 
 #[test]
