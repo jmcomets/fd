@@ -170,9 +170,9 @@ impl LsColors {
 
     pub fn print_with_style<'a>(&self, s: &str, style: PaintStyle<'a>) -> io::Result<()> {
         let style = match style {
-            PaintStyle::Directory    => Some(Cow::Borrowed(&self.directory)),
-            PaintStyle::Executable   => Some(Cow::Borrowed(&self.executable)),
-            PaintStyle::Symlink      => Some(Cow::Borrowed(&self.symlink)),
+            PaintStyle::Directory    => Cow::Borrowed(&self.directory),
+            PaintStyle::Executable   => Cow::Borrowed(&self.executable),
+            PaintStyle::Symlink      => Cow::Borrowed(&self.symlink),
 
             PaintStyle::Filename(f)  => {
                 f.file_name()
@@ -185,16 +185,13 @@ impl LsColors {
                             .and_then(|e| self.extensions.get(e))
                             .map(Cow::Borrowed)
                     })
+                    .unwrap_or_default()
             }
         };
 
-        if let Some(style) = style {
-            let mut stdout = StandardStream::stdout(ColorChoice::Always);
-            try!(stdout.set_color(&style.to_color_spec()));
-            write!(&mut stdout, "{}", s)
-        } else {
-            write!(&mut io::stdout(), "{}", s)
-        }
+        let mut stdout = StandardStream::stdout(ColorChoice::Always);
+        try!(stdout.set_color(&style.to_color_spec()));
+        write!(&mut stdout, "{}", s)
     }
 }
 
@@ -222,6 +219,12 @@ impl Style {
         }
 
         c
+    }
+}
+
+impl Default for Style {
+    fn default() -> Style {
+        Style(Color::White, TextStyle::default())
     }
 }
 
@@ -256,6 +259,12 @@ enum TextStyle {
     Bold,
     Italic,
     Underline,
+}
+
+impl Default for TextStyle {
+    fn default() -> TextStyle {
+        TextStyle::Normal
+    }
 }
 
 #[test]
