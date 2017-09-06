@@ -8,19 +8,24 @@ extern crate ignore;
 pub mod lscolors;
 pub mod fshelper;
 
+mod utils;
+
+use utils::IntoInits;
+
+use std::borrow::Borrow;
 use std::borrow::Cow;
 use std::env;
 use std::error::Error;
-use std::io::Write;
-use std::ops::Deref;
+use std::io;
+use std::io::{Write, BufWriter};
 #[cfg(target_family = "unix")]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, Component};
+use std::path::{PathBuf, Path, Component};
 use std::process;
 
 use clap::{App, AppSettings, Arg};
 use atty::Stream;
-use regex::{Regex, RegexBuilder};
+use regex::{Match, Regex, RegexBuilder};
 use ignore::WalkBuilder;
 
 use lscolors::LsColors;
@@ -70,99 +75,141 @@ struct FdOptions {
     ls_colors: Option<LsColors>
 }
 
+/// Path separator (taken from ::sys::path::MAIN_SEP_STR)
+#[cfg(target_family = "unix")]
+static MAIN_SEPARATOR : &'static str = "/";
+#[cfg(not(target_family = "unix"))]
+static MAIN_SEPARATOR : &'static str = "\\";
+
 /// Root directory
+#[cfg(target_family = "unix")]
 static ROOT_DIR : &'static str = "/";
+#[cfg(not(target_family = "unix"))]
+static ROOT_DIR : &'static str = "\\";
 
 /// Parent directory
 static PARENT_DIR : &'static str = "..";
 
+/// Current directory
+static CURRENT_DIR : &'static str = ".";
+
+fn component_to_str<'a>(component: Component<'a>) -> Cow<'a, str> {
+    match component {
+        Component::Prefix(p) => p.as_os_str().to_string_lossy(),
+        Component::RootDir   => Cow::Borrowed(ROOT_DIR),
+        Component::CurDir    => Cow::Borrowed(CURRENT_DIR),
+        Component::ParentDir => Cow::Borrowed(PARENT_DIR),
+        Component::Normal(p) => p.to_string_lossy(),
+    }
+}
+
 /// Print a search result to the console.
-fn print_entry(base: &Path, entry: &Path, config: &FdOptions) {
-    let path_full = base.join(entry);
-
-    let path_str = entry.to_string_lossy();
-
-    #[cfg(target_family = "unix")]
-    let is_executable = |p: &std::path::PathBuf| {
-        p.metadata()
-         .ok()
-         .map(|f| f.permissions().mode() & 0o111 != 0)
-         .unwrap_or(false)
-    };
-
-    #[cfg(not(target_family = "unix"))]
-    let is_executable =  |p: &std::path::PathBuf| {false};
-
-    if let Some(ref ls_colors) = config.ls_colors {
-        let default_style = ansi_term::Style::default();
-
-        let mut component_path = base.to_path_buf();
-
-        if config.path_display == PathDisplay::Absolute {
-            print!("{}", ls_colors.directory.paint(ROOT_DIR));
-        }
-
-        // Traverse the path and colorize each component
-        for component in entry.components() {
-            let comp_str = match component {
-                Component::Normal(p) => p.to_string_lossy(),
-                Component::ParentDir => Cow::from(PARENT_DIR),
-                _                    => error("Error: unexpected path component.")
-            };
-
-            component_path.push(Path::new(comp_str.deref()));
-
-            let style =
-                if component_path.symlink_metadata()
-                                 .map(|md| md.file_type().is_symlink())
-                                 .unwrap_or(false) {
-                    &ls_colors.symlink
-                } else if component_path.is_dir() {
-                    &ls_colors.directory
-                } else if is_executable(&component_path) {
-                    &ls_colors.executable
-                } else {
-                    // Look up file name
-                    let o_style =
-                        component_path.file_name()
-                                      .and_then(|n| n.to_str())
-                                      .and_then(|n| ls_colors.filenames.get(n));
-
-                    match o_style {
-                        Some(s) => s,
-                        None =>
-                            // Look up file extension
-                            component_path.extension()
-                                          .and_then(|e| e.to_str())
-                                          .and_then(|e| ls_colors.extensions.get(e))
-                                          .unwrap_or(&default_style)
-                    }
-                };
-
-            print!("{}", style.paint(comp_str));
-
-            if component_path.is_dir() && component_path != path_full {
-                let sep = std::path::MAIN_SEPARATOR.to_string();
-                print!("{}", style.paint(sep));
-            }
-        }
-        if config.null_separator {
-          print!("{}", '\0');
-        } else {
-          println!();
-        }
+fn display_entry<'a>(path: &'a Path, matching: Match, ls_colors: &Option<LsColors>) -> Cow<'a, str> {
+    if let &Some(ref ls_colors) = ls_colors {
+        display_styled_entry(path, matching, ls_colors)
     } else {
-        // Uncolorized output
+        path.to_string_lossy()
+    }
+}
 
-        let prefix = if config.path_display == PathDisplay::Absolute { ROOT_DIR } else { "" };
-        let separator = if config.null_separator { "\0" } else { "\n" };
+fn display_styled_entry<'a>(path: &'a Path, matching: Match, ls_colors: &LsColors) -> Cow<'a, str> {
+    let (match_start, match_end) = (matching.start(), matching.end());
 
-        let r = write!(&mut std::io::stdout(), "{}{}{}", prefix, path_str, separator);
+    // Get each path component as a string
+    let component_strs: Vec<_> = path.components()
+        .map(component_to_str)
+        .collect();
 
-        if r.is_err() {
-            // Probably a broken pipe. Exit gracefully.
-            process::exit(0);
+    // Get each path component's full path
+    let component_paths: Vec<_> = component_strs.iter()
+        .inits()
+        .map(|ss| {
+            let v: Vec<_> = ss.into_iter()
+                .map(|s| s.borrow())
+                .collect();
+
+            v.join(MAIN_SEPARATOR)
+        })
+        .map(|s| PathBuf::from(s))
+        .collect();
+
+    // For each path component, retrieve the appropriate style using the full path, and style
+    // the component's string accordingly, optionally underlining the section that's in the
+    // match.
+    let styled_strs = component_paths.iter()
+        .map(|p| get_path_style(&ls_colors, &p))
+        .zip(component_strs.iter());
+
+    let output = styled_strs
+        .map(|(style, s)| style.paint(s.to_string()).to_string())
+        .collect::<Vec<_>>()
+        .join(&ls_colors.directory.paint(MAIN_SEPARATOR).to_string());
+
+    Cow::Owned(output)
+}
+
+// path -> (base, entry)
+fn display_styled_entry_0(base: &Path, entry: &Path, matching: Match, ls_colors: &LsColors) -> String {
+    let path_full = base.join(entry);
+    let mut component_path = base.to_path_buf();
+
+    let mut display = String::new();
+
+    for component in entry.components() {
+        let comp_str = component_to_str(component);
+
+        component_path.push(Path::new(&*comp_str));
+
+        let style = get_path_style(ls_colors, &component_path);
+
+        display += &style.paint(comp_str).to_string();
+
+        if component_path.is_dir() && component_path != path_full {
+            display += &style.paint(MAIN_SEPARATOR).to_string();
         }
+    }
+
+    display
+}
+
+#[cfg(target_family = "unix")]
+fn is_executable(p: &Path) -> bool {
+    p.metadata()
+        .ok()
+        .map(|f| f.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_family = "unix"))]
+fn is_executable(_: &Path) -> bool {
+    false
+}
+
+fn is_symlink(path: &Path) -> bool {
+    path.symlink_metadata()
+        .map(|md| md.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn get_path_style<'a>(ls_colors: &'a LsColors, path: &Path) -> Cow<'a, ansi_term::Style> {
+    if is_symlink(path) {
+        Cow::Borrowed(&ls_colors.symlink)
+    } else if path.is_dir() {
+        Cow::Borrowed(&ls_colors.directory)
+    } else if is_executable(&path) {
+        Cow::Borrowed(&ls_colors.executable)
+    } else {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| ls_colors.filenames.get(n))
+            .map(Cow::Borrowed)
+            .or_else(|| {
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .and_then(|e| ls_colors.extensions.get(e))
+                    .map(Cow::Borrowed)
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -182,31 +229,47 @@ fn scan(root: &Path, pattern: &Regex, base: &Path, config: &FdOptions) {
                      .filter_map(|e| e.ok())
                      .filter(|e| e.path() != root);
 
+    let output = io::stdout();
+    let mut writer = BufWriter::new(output.lock());
+
     for entry in walker {
-        let path_rel_buf = match fshelper::path_relative_from(entry.path(), base) {
-            Some(p) => p,
-            None => error("Error: could not get relative path for directory entry.")
-        };
-        let path_rel = path_rel_buf.as_path();
+        let path = entry.path();
+        let path_rel = fshelper::path_relative_from(path, base)
+            .unwrap_or_else(|| {
+                error("Error: could not get relative path for directory entry.")
+            });
 
         let search_str_o =
             if config.search_full_path {
                 Some(path_rel.to_string_lossy())
             } else {
                 path_rel.file_name()
-                        .map(|f| f.to_string_lossy())
+                    .map(|f| f.to_string_lossy())
             };
 
         if let Some(search_str) = search_str_o {
-            pattern.find(&*search_str)
-                      .map(|_| print_entry(base, path_rel, config));
+            let search_match = pattern.find(&*search_str);
+            if let Some(matching) = search_match {
+                let path =
+                    if config.path_display != PathDisplay::Absolute {
+                        &path_rel
+                    } else {
+                        path
+                    };
+
+                let s = display_entry(path, matching, &config.ls_colors);
+
+                let separator = if config.null_separator { '\0' } else { '\n' };
+                write!(&mut writer, "{}{}", s, separator)
+                    .expect("Failed writing to stdout");
+            }
         }
     }
 }
 
 /// Print error message to stderr and exit with status `1`.
 fn error(message: &str) -> ! {
-    writeln!(&mut std::io::stderr(), "{}", message)
+    writeln!(&mut io::stderr(), "{}", message)
         .expect("Failed writing to stderr");
     process::exit(1);
 }
